@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Puget Sound & Rivers Fishing Map</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <!-- Leaflet CSS from CDN -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css"/>
+  <style>
+    html, body, #map { height: 100%; width: 100%; margin: 0; }
+    .leaflet-container { font-family: system-ui, sans-serif; }
+    .panel {
+      position: absolute;
+      left: 10px; top: 10px; z-index: 1000;
+      background: rgba(255,255,255,0.98);
+      padding: 12px; border-radius: 8px;
+      max-width: 340px; font-size: 15px;
+      box-shadow: 0 2px 16px rgba(0,0,0,0.08);
+    }
+    .modal-bg {
+      position:fixed;top:0;left:0;width:100vw;height:100vh;
+      background:rgba(0,0,0,0.45);display:flex;align-items:center;justify-content:center;z-index:2000;
+    }
+    .modal {
+      background:white;border-radius:8px;padding:20px;min-width:300px;box-shadow:0 2px 16px rgba(0,0,0,0.22);position:relative;
+    }
+    .close-btn { position:absolute;right:14px;top:10px;font-size:18px;background:none;border:none;cursor:pointer;}
+    .species-toggle { width: 100%; margin-bottom: 8px; }
+    @media (max-width: 600px) {
+      .panel { max-width: 95vw; font-size: 13px;}
+      .modal { min-width:180px; }
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="panel" id="panel">
+    <b>Puget Sound & Rivers Fishing Map</b><br>
+    Fish Species:
+    <select id="species-select" class="species-toggle"></select>
+    <br>
+    <button onclick="location.reload()">Puget Sound Map</button>
+    <button onclick="openShareModal()" style="margin-left:10px">Share Your Catch</button>
+    <br>
+    <small>
+      Toggle a species to see only overlays, rules, and tips for that fish. Click any area for the best trolling spot, depth, and live info.
+    </small>
+  </div>
+  <div id="modals"></div>
+
+  <!-- Leaflet JS from CDN -->
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <!-- Simple fishing map logic -->
+  <script>
+    // --- Data ---
+    const FISH_SPECIES = [
+      { id:"chinook", label:"Chinook Salmon", bestDepth:"60-200ft", habitats:["marine"], snagRisk:true, baits:["Herring","Flasher","Spoon"], tips:"Troll deep in summer. Early morning best.", run:"July-Sept" },
+      { id:"coho", label:"Coho Salmon", bestDepth:"20-80ft", habitats:["marine","river"], snagRisk:true, baits:["Hootchie","Spoon","Herring"], tips:"Midwater, river mouths late summer.", run:"Aug-Oct" },
+      { id:"pink", label:"Pink Salmon", bestDepth:"10-40ft", habitats:["marine","river"], snagRisk:false, baits:["Pink jig","Buzz Bomb"], tips:"Odd years. Near rivers.", run:"Aug-Sep (odd years)" },
+      { id:"sockeye", label:"Sockeye Salmon", bestDepth:"10-50ft", habitats:["marine","river"], snagRisk:false, baits:["Red hook","Krill"], tips:"Shore, river mouths.", run:"Jun-Aug" },
+      { id:"chum", label:"Chum Salmon", bestDepth:"5-30ft", habitats:["marine","river"], snagRisk:true, baits:["Green fly","Herring"], tips:"Muddy flats, Nov-Dec.", run:"Nov-Dec" },
+      { id:"halibut", label:"Halibut", bestDepth:"100-500ft", habitats:["marine"], snagRisk:true, baits:["Herring","Octopus"], tips:"Deep, sandy flats.", run:"May-Jun" },
+      { id:"lingcod", label:"Lingcod", bestDepth:"30-150ft", habitats:["marine"], snagRisk:true, baits:["Jig","Swimbait"], tips:"Reefs, rocky.", run:"May-Jun" },
+      { id:"steelhead", label:"Steelhead", bestDepth:"2-10ft", habitats:["river"], snagRisk:true, baits:["Eggs","Spoon"], tips:"Deep pools, riffles.", run:"Dec-Apr, Jun" }
+    ];
+
+    // --- UI: Populate fish selector ---
+    const speciesSelect = document.getElementById("species-select");
+    FISH_SPECIES.forEach(f => {
+      let opt = document.createElement("option");
+      opt.value = f.id; opt.innerText = f.label;
+      speciesSelect.appendChild(opt);
+    });
+
+    // --- Map Init ---
+    const map = L.map('map').setView([47.6, -122.4], 9);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', { attribution: '© Carto' }).addTo(map);
+
+    // --- Live overlays for demo ---
+    let overlays = {};
+
+    // --- Fetch Marine Zones (GeoJSON, WDFW public) ---
+    function fetchZones() {
+      return fetch("https://opendata.arcgis.com/datasets/4c4c6c9e9c8a4e1cb5d2a65d7b6d43f1_0.geojson")
+      .then(r=>r.json()).then(j=>j.features || []);
+    }
+    // --- Fetch Rivers (WA public, demo) ---
+    function fetchRivers() {
+      return fetch("https://opendata.arcgis.com/datasets/6b6a1d5c31f94de6a246c1a065af65e6_0.geojson")
+      .then(r=>r.json()).then(j=>j.features || []);
+    }
+    // --- Fetch Underwater Debris/Snags (NOAA/WA, demo) ---
+    function fetchDebris() {
+      return fetch("https://opendata.arcgis.com/datasets/0397e7f5d80a4d9e8be4b6c7e1b07e77_0.geojson")
+      .then(r=>r.json()).then(j=>j.features || []);
+    }
+
+    // --- Show overlays by species ---
+    let currentSpecies = FISH_SPECIES[0].id;
+    speciesSelect.value = currentSpecies;
+    function updateOverlays() {
+      // Remove all overlays
+      Object.values(overlays).forEach(layer => map.removeLayer(layer));
+      overlays = {};
+
+      let species = FISH_SPECIES.find(f=>f.id===currentSpecies);
+      // Zones overlay
+      fetchZones().then(zones => {
+        overlays.zones = L.geoJSON(zones.filter(z => (species.habitats.includes('marine'))), {
+          style: {color:"#0070f3",weight:2,fillOpacity:0.07},
+          onEachFeature: (feature, layer) => {
+            layer.bindTooltip(feature.properties.AREA_NAME);
+            layer.on("click", () => openZoneModal(feature));
+          }
+        }).addTo(map);
+      });
+      // Rivers overlay
+      fetchRivers().then(rivers => {
+        overlays.rivers = L.geoJSON(rivers.filter(r => (species.habitats.includes('river'))), {
+          style: {color:"#009966",weight:3,fillOpacity:0.15},
+          onEachFeature: (feature, layer) => {
+            layer.bindTooltip(feature.properties.NAME);
+            layer.on("click", () => openRiverModal(feature));
+          }
+        }).addTo(map);
+      });
+      // Debris overlay
+      if (species.snagRisk) {
+        fetchDebris().then(debris => {
+          overlays.debris = L.geoJSON(debris, {
+            style: {color:"#aa3333",weight:1,fillOpacity:0.19},
+            onEachFeature: (feature, layer) => {
+              layer.bindTooltip("Underwater Hazard: " + (feature.properties?.desc||"debris/snag"));
+            }
+          }).addTo(map);
+        });
+      }
+      // Best Trolling Spot (AI: centroid for demo)
+      setTimeout(() => {
+        if (overlays.zones) {
+          overlays.zones.eachLayer(layer => {
+            let c = layer.feature.geometry.coordinates.flat(2);
+            let lat = c.reduce((a,b)=>a+b[1],0)/c.length;
+            let lon = c.reduce((a,b)=>a+b[0],0)/c.length;
+            if (isFinite(lat) && isFinite(lon)) {
+              let marker = L.marker([lat,lon],{icon:L.divIcon({className:"",html:"🎣",iconSize:[24,24]})})
+                .addTo(map)
+                .bindTooltip("Best Trolling Start<br>Depth: "+species.bestDepth);
+              overlays['troll'+layer._leaflet_id] = marker;
+            }
+          });
+        }
+      }, 1000);
+    }
+
+    // --- Species change handler ---
+    speciesSelect.onchange = function() {
+      currentSpecies = speciesSelect.value;
+      updateOverlays();
+    };
+    updateOverlays();
+
+    // --- Zone Modal ---
+    function openZoneModal(feature) {
+      let species = FISH_SPECIES.find(f=>f.id===currentSpecies);
+      let html = `
+        <div class="modal-bg" onclick="closeModal()">
+          <div class="modal" onclick="event.stopPropagation()">
+            <button class="close-btn" onclick="closeModal()">×</button>
+            <h2>${feature.properties.AREA_NAME}</h2>
+            <b>${species.label}</b><br>
+            <b>Best Trolling Depth:</b> ${species.bestDepth}<br>
+            <b>Bait:</b> ${species.baits.join(", ")}<br>
+            <b>Tips:</b> ${species.tips}<br>
+            <b>Season:</b> ${species.run}<br>
+            <hr>
+            <b>Live Info:</b> <span id="zone-weather">Loading...</span>
+          </div>
+        </div>`;
+      document.getElementById("modals").innerHTML = html;
+      // Fetch live weather
+      let c = feature.geometry.coordinates.flat(2);
+      let lat = c.reduce((a,b)=>a+b[1],0)/c.length;
+      let lon = c.reduce((a,b)=>a+b[0],0)/c.length;
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`)
+        .then(r=>r.json())
+        .then(d=>{
+          let w = d.current_weather;
+          if (w) document.getElementById("zone-weather").innerText = `${w.temperature}°C, wind ${w.windspeed} km/h`;
+        });
+    }
+    function openRiverModal(feature) {
+      let species = FISH_SPECIES.find(f=>f.id===currentSpecies);
+      let html = `
+        <div class="modal-bg" onclick="closeModal()">
+          <div class="modal" onclick="event.stopPropagation()">
+            <button class="close-btn" onclick="closeModal()">×</button>
+            <h2>${feature.properties.NAME}</h2>
+            <b>${species.label}</b><br>
+            <b>Best Depth:</b> ${species.bestDepth}<br>
+            <b>Bait:</b> ${species.baits.join(", ")}<br>
+            <b>Tips:</b> ${species.tips}<br>
+            <b>Season:</b> ${species.run}<br>
+            <hr>
+            <b>Live Info:</b> <span id="river-weather">Loading...</span>
+          </div>
+        </div>`;
+      document.getElementById("modals").innerHTML = html;
+      // Fetch live weather
+      let c = feature.geometry.coordinates.flat(2);
+      let lat = c.reduce((a,b)=>a+b[1],0)/c.length;
+      let lon = c.reduce((a,b)=>a+b[0],0)/c.length;
+      fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current_weather=true`)
+        .then(r=>r.json())
+        .then(d=>{
+          let w = d.current_weather;
+          if (w) document.getElementById("river-weather").innerText = `${w.temperature}°C, wind ${w.windspeed} km/h`;
+        });
+    }
+    function closeModal() { document.getElementById("modals").innerHTML = "" }
+
+    // --- Share Your Catch Modal ---
+    function openShareModal() {
+      let html = `
+      <div class="modal-bg" onclick="closeModal()">
+        <div class="modal" onclick="event.stopPropagation()">
+          <button class="close-btn" onclick="closeModal()">×</button>
+          <h2>Share Your Catch</h2>
+          <form id="catch-form">
+            Species:
+            <select name="species">
+              ${FISH_SPECIES.map(s=>`<option value="${s.id}">${s.label}</option>`).join("")}
+            </select><br>
+            Size (in):
+            <input name="size" type="number" min="0"><br>
+            Location:
+            <input name="location" placeholder="e.g. Marine Area 10"><br>
+            Bait/Method:
+            <input name="bait" placeholder="e.g. Herring on flasher"><br>
+            Notes:<br>
+            <textarea name="notes"></textarea><br>
+            Photo (not saved in demo): <input type="file" accept="image/*"><br>
+            <button type="submit">Submit Catch</button>
+          </form>
+        </div>
+      </div>`;
+      document.getElementById("modals").innerHTML = html;
+      document.getElementById("catch-form").onsubmit = function(e) {
+        e.preventDefault();
+        closeModal();
+        alert("Thank you for sharing your catch! (Demo: catch not saved)");
+      };
+    }
+    window.openShareModal = openShareModal;
+    window.closeModal = closeModal;
+  </script>
+</body>
+</html>
